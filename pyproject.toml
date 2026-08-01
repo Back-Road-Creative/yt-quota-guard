@@ -9,7 +9,7 @@ description = "Global YouTube Data API quota accountant for a fleet of scripts s
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "Joe Petrucelli", email = "joepetjr@gmail.com" }]
+authors = [{ name = "Joe Petrucelli", email = "backroadcreativeco@gmail.com" }]
 keywords = ["youtube", "youtube-data-api", "quota", "rate-limit", "google-api"]
 classifiers = [
   "Development Status :: 4 - Beta",
