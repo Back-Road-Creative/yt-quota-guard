@@ -166,8 +166,8 @@ it follows daylight saving: the boundary is 07:00 UTC in summer and 08:00 UTC
 in winter. `reset_tz` takes a `tzinfo` or an IANA name:
 
 ```python
-QuotaManager(project_id="p")                          # midnight Pacific
-QuotaManager(project_id="p", reset_tz="UTC")          # midnight UTC
+QuotaManager(project_id="p")  # midnight Pacific
+QuotaManager(project_id="p", reset_tz="UTC")  # midnight UTC
 QuotaManager(project_id="p", reset_tz="Europe/Paris")
 ```
 
