@@ -160,25 +160,39 @@ leaves a lock the other cannot acquire.
 ## Daily rollover
 
 The ledger resets the first time it is read or written after the day changes —
-lazily, on access, not on a timer. Google's day ends at midnight Pacific; this
-library defaults to **UTC** so that behaviour does not depend on a timezone
-database being installed. To line up with Google exactly:
+lazily, on access, not on a timer. Google's quota day ends at midnight Pacific
+Time, so that is the default boundary (`reset_tz="America/Los_Angeles"`), and
+it follows daylight saving: the boundary is 07:00 UTC in summer and 08:00 UTC
+in winter. `reset_tz` takes a `tzinfo` or an IANA name:
 
 ```python
-from zoneinfo import ZoneInfo
-
-QuotaManager(project_id="p", reset_tz=ZoneInfo("America/Los_Angeles"))
+QuotaManager(project_id="p")                          # midnight Pacific
+QuotaManager(project_id="p", reset_tz="UTC")          # midnight UTC
+QuotaManager(project_id="p", reset_tz="Europe/Paris")
 ```
 
-The UTC default rolls over *earlier* than Google does (UTC midnight is late
-afternoon Pacific), so for part of each day it under-reports what Google
-thinks you have spent. If you run close to the cap, set `reset_tz`.
+The zone is stored in the ledger (`reset_tz` key). A ledger has one boundary:
+a caller that passes a different zone than the ledger's gets
+`ResetZoneMismatchError` instead of shifting the boundary for everyone else.
+Pacific time needs a timezone database; on a system without one (typically
+Windows) install `tzdata`, or pass `reset_tz="UTC"`, otherwise constructing a
+manager raises a `RuntimeError` saying so.
+
+### Upgrading from 0.1.0 (default was UTC)
+
+The default changed from UTC to Pacific. Existing ledgers keep their spent
+units and operations: a ledger with no stored zone adopts the zone of the first
+caller that opens it, and nothing is reset at upgrade time. Because UTC
+midnight falls in the late afternoon Pacific, a ledger last rolled at UTC
+midnight simply carries its units until the next Pacific midnight, so the
+switch never grants a second allowance. To keep the old boundary, pass
+`reset_tz="UTC"` everywhere.
 
 ## API
 
 | | |
 | --- | --- |
-| `QuotaManager(project_id, brand_id=None, storage_path=None, daily_limit=10000, cost_table=None, reset_tz=datetime.UTC)` | Open or create a project ledger. |
+| `QuotaManager(project_id, brand_id=None, storage_path=None, daily_limit=10000, cost_table=None, reset_tz="America/Los_Angeles")` | Open or create a project ledger. |
 | `.track_operation(operation, cost, metadata=None, enforce=False)` | Record a call and charge it. Returns the `QuotaOperation`. |
 | `.estimate_cost(operation_type, default=None)` | Table lookup. Raises `UnknownOperationError` if unknown. |
 | `.reserve(operation, cost=None, metadata=None)` | Atomically check the limit and hold units. Returns a `Reservation`; raises `QuotaExceededError`. |

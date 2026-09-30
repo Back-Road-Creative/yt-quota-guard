@@ -9,7 +9,8 @@ something outside them keeps the books.
 :class:`QuotaManager` is that book. It records every operation with its unit
 cost in one JSON file per project, guards read-modify-write with a file lock
 so concurrent processes on the same host cannot lose each other's updates,
-and rolls the ledger over on a configurable daily boundary.
+and rolls the ledger over at midnight Pacific Time, the boundary Google uses
+for its daily quota (configurable with ``reset_tz``).
 
 ``check_quota`` followed by ``track_operation`` is two separate lock holds, so
 two callers can both pass the check for the same remaining units.
@@ -28,12 +29,14 @@ from datetime import UTC, datetime, tzinfo
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from filelock import FileLock
 
 __all__ = [
     "DEFAULT_COST_TABLE",
     "DEFAULT_DAILY_LIMIT",
+    "DEFAULT_RESET_TZ",
     "ENV_STORAGE_PATH",
     "LOCK_FILE_MODE",
     "OperationCost",
@@ -41,6 +44,7 @@ __all__ = [
     "QuotaManager",
     "QuotaOperation",
     "Reservation",
+    "ResetZoneMismatchError",
     "UnknownOperationError",
     "UnknownReservationError",
     "default_storage_path",
@@ -54,6 +58,9 @@ DEFAULT_DAILY_LIMIT = 10_000
 #: starts complaining, and the point at which it escalates to CRITICAL.
 WARN_THRESHOLD_PCT = 80.0
 CRITICAL_THRESHOLD_PCT = 90.0
+
+#: IANA zone whose midnight ends Google's quota day. The default ``reset_tz``.
+DEFAULT_RESET_TZ = "America/Los_Angeles"
 
 #: Mode applied to the lock file. Group-writable (rather than filelock's
 #: default 0o644) so two UNIX accounts in the same group can share one
@@ -159,6 +166,41 @@ class UnknownReservationError(KeyError):
     """
 
 
+class ResetZoneMismatchError(ValueError):
+    """Raised when a caller's ``reset_tz`` differs from the ledger's own zone.
+
+    A ledger rolls over at one boundary. Two callers that disagree about it
+    would each reset the day at a different moment, so the zone recorded in
+    the ledger wins and a conflicting caller is refused rather than allowed to
+    shift the boundary.
+    """
+
+
+def _utcnow() -> datetime:
+    """The current instant. A seam so tests can pin the clock."""
+    return datetime.now(UTC)
+
+
+def _resolve_zone(reset_tz: tzinfo | str | None) -> tzinfo:
+    """Turn a ``reset_tz`` argument into a tzinfo, defaulting to Pacific."""
+    if isinstance(reset_tz, tzinfo):
+        return reset_tz
+    name = DEFAULT_RESET_TZ if reset_tz is None else reset_tz
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"no timezone data for {name!r}. Install the tzdata package "
+            f"(pip install tzdata), or pass reset_tz=datetime.UTC to roll the "
+            f"ledger over at UTC midnight instead."
+        ) from exc
+
+
+def _zone_label(zone: tzinfo) -> str:
+    """A stable name for ``zone``: its IANA key when it has one."""
+    return getattr(zone, "key", None) or str(zone)
+
+
 def default_storage_path() -> Path:
     """Return the directory the ledger lives in when none is supplied.
 
@@ -242,9 +284,13 @@ class QuotaManager:
             :data:`DEFAULT_DAILY_LIMIT`.
         cost_table: Operation-name to unit-cost mapping used by
             :meth:`estimate_cost`. Defaults to :data:`DEFAULT_COST_TABLE`.
-        reset_tz: Timezone whose midnight rolls the ledger over. Defaults to
-            UTC. Google resets at midnight Pacific; pass
-            ``ZoneInfo("America/Los_Angeles")`` to match it.
+        reset_tz: Timezone whose midnight rolls the ledger over: a tzinfo or
+            an IANA name. Defaults to ``America/Los_Angeles``, Google's quota
+            day. The zone is stored in the ledger, and a caller that passes a
+            different one is refused with :class:`ResetZoneMismatchError`. A
+            ledger written before the zone was recorded adopts the first
+            caller's zone, keeping its spent units. Pass ``UTC`` to keep the
+            0.1.0 behaviour.
     """
 
     def __init__(
@@ -254,7 +300,7 @@ class QuotaManager:
         storage_path: Path | str | None = None,
         daily_limit: int = DEFAULT_DAILY_LIMIT,
         cost_table: dict[str, int] | None = None,
-        reset_tz: tzinfo = UTC,
+        reset_tz: tzinfo | str | None = None,
     ) -> None:
         if daily_limit <= 0:
             raise ValueError(f"daily_limit must be positive, got {daily_limit}")
@@ -265,7 +311,7 @@ class QuotaManager:
         self.cost_table = (
             dict(cost_table) if cost_table is not None else dict(DEFAULT_COST_TABLE)
         )
-        self.reset_tz = reset_tz
+        self.reset_tz = _resolve_zone(reset_tz)
 
         root = (
             Path(storage_path) if storage_path is not None else default_storage_path()
@@ -285,7 +331,7 @@ class QuotaManager:
         self.operations: list[QuotaOperation] = []
         self.reservations: list[Reservation] = []
         self.total_used = 0
-        self.last_reset = datetime.now(UTC)
+        self.last_reset = _utcnow()
 
         self.refresh()
 
@@ -312,13 +358,21 @@ class QuotaManager:
             self._reset_locked()
             return
 
+        stored_zone = data.get("reset_tz")
+        if stored_zone is not None and stored_zone != _zone_label(self.reset_tz):
+            raise ResetZoneMismatchError(
+                f"ledger {self.quota_file} rolls over at midnight {stored_zone}, "
+                f"but this manager was given reset_tz="
+                f"{_zone_label(self.reset_tz)!r}. Use the ledger's zone."
+            )
+
         last_reset = datetime.fromisoformat(
             data.get("last_reset", "2000-01-01T00:00:00+00:00")
         )
         if last_reset.tzinfo is None:
             last_reset = last_reset.replace(tzinfo=UTC)
 
-        now = datetime.now(UTC)
+        now = _utcnow()
         if (
             now.astimezone(self.reset_tz).date()
             > last_reset.astimezone(self.reset_tz).date()
@@ -336,7 +390,7 @@ class QuotaManager:
         self.operations = []
         self.reservations = []
         self.total_used = 0
-        self.last_reset = datetime.now(UTC)
+        self.last_reset = _utcnow()
         self._save_locked()
 
     def _save_locked(self) -> None:
@@ -346,6 +400,7 @@ class QuotaManager:
             "total_used": self.total_used,
             "daily_limit": self.daily_limit,
             "last_reset": self.last_reset.isoformat(),
+            "reset_tz": _zone_label(self.reset_tz),
             "operations": [asdict(op) for op in self.operations],
             "reservations": [asdict(res) for res in self.reservations],
         }
@@ -429,7 +484,7 @@ class QuotaManager:
         record = QuotaOperation(
             operation=operation,
             cost=cost,
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=_utcnow().isoformat(),
             brand_id=self.brand_id,
             metadata=metadata,
         )
@@ -477,7 +532,7 @@ class QuotaManager:
                 id=uuid.uuid4().hex,
                 operation=operation,
                 cost=cost,
-                timestamp=datetime.now(UTC).isoformat(),
+                timestamp=_utcnow().isoformat(),
                 brand_id=self.brand_id,
                 metadata=metadata,
             )
