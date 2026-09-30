@@ -16,7 +16,9 @@ from .manager import (
     QuotaExceededError,
     QuotaManager,
     QuotaOperation,
+    Reservation,
     UnknownOperationError,
+    UnknownReservationError,
     default_storage_path,
 )
 
@@ -33,7 +35,9 @@ __all__ = [
     "QuotaExceededError",
     "QuotaManager",
     "QuotaOperation",
+    "Reservation",
     "UnknownOperationError",
+    "UnknownReservationError",
     "__version__",
     "default_storage_path",
 ]

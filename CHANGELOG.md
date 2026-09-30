@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Add `QuotaManager.reserve`, `commit` and `release` (and the `Reservation` and
+  `UnknownReservationError` types): an atomic check-and-hold that closes the
+  gap between `check_quota` and `track_operation`, where two callers could both
+  pass the check for the same units. Holds count against the limit, are never
+  expired automatically, and `get_usage()` gains a `reserved` key. `check_quota`
+  and `can_safely_perform` remain informational.
+
 ## 0.1.0
 
 First release.

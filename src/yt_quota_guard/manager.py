@@ -10,12 +10,19 @@ something outside them keeps the books.
 cost in one JSON file per project, guards read-modify-write with a file lock
 so concurrent processes on the same host cannot lose each other's updates,
 and rolls the ledger over on a configurable daily boundary.
+
+``check_quota`` followed by ``track_operation`` is two separate lock holds, so
+two callers can both pass the check for the same remaining units.
+:meth:`QuotaManager.reserve` is the atomic alternative: it checks the limit and
+holds the units in one lock hold, and :meth:`QuotaManager.commit` or
+:meth:`QuotaManager.release` settles the hold afterwards.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, tzinfo
 from enum import IntEnum
@@ -33,7 +40,9 @@ __all__ = [
     "QuotaExceededError",
     "QuotaManager",
     "QuotaOperation",
+    "Reservation",
     "UnknownOperationError",
+    "UnknownReservationError",
     "default_storage_path",
 ]
 
@@ -141,6 +150,15 @@ class UnknownOperationError(KeyError):
     """
 
 
+class UnknownReservationError(KeyError):
+    """Raised when committing a reservation the ledger has no record of.
+
+    The hold is gone and no operation carries its id: it was released, or the
+    ledger rolled over to a new day since it was made. Nothing is charged; the
+    caller decides whether to record the spend with ``track_operation``.
+    """
+
+
 def default_storage_path() -> Path:
     """Return the directory the ledger lives in when none is supplied.
 
@@ -182,6 +200,23 @@ class QuotaOperation:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class Reservation:
+    """Units held against the daily limit for a call not yet settled.
+
+    Returned by :meth:`QuotaManager.reserve`. Settle it exactly once, with
+    :meth:`QuotaManager.commit` if the request was (or may have been) sent, or
+    :meth:`QuotaManager.release` if it certainly was not.
+    """
+
+    id: str
+    operation: str
+    cost: int
+    timestamp: str
+    brand_id: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
 class QuotaManager:
     """Ledger for one Google Cloud project's daily API quota.
 
@@ -189,6 +224,11 @@ class QuotaManager:
     re-reads, mutates and saves inside a single lock hold. Two processes
     sharing a storage path therefore see the same running total; neither can
     overwrite the other's operations with a stale copy.
+
+    Units held by :meth:`reserve` count against the limit alongside recorded
+    spend. A hold is never expired or refunded automatically: a process that
+    died after sending its request may already have consumed the quota, so the
+    hold stays until it is committed, released, or the day rolls over.
 
     Args:
         project_id: Google Cloud project the quota belongs to. This is the
@@ -243,6 +283,7 @@ class QuotaManager:
         self._lock = group_writable_filelock(self.lock_file)
 
         self.operations: list[QuotaOperation] = []
+        self.reservations: list[Reservation] = []
         self.total_used = 0
         self.last_reset = datetime.now(UTC)
 
@@ -286,12 +327,14 @@ class QuotaManager:
             return
 
         self.operations = [QuotaOperation(**op) for op in data.get("operations", [])]
+        self.reservations = [Reservation(**res) for res in data.get("reservations", [])]
         self.total_used = data.get("total_used", 0)
         self.last_reset = last_reset
 
     def _reset_locked(self) -> None:
         """Zero the ledger and persist. Caller must hold ``self._lock``."""
         self.operations = []
+        self.reservations = []
         self.total_used = 0
         self.last_reset = datetime.now(UTC)
         self._save_locked()
@@ -304,6 +347,7 @@ class QuotaManager:
             "daily_limit": self.daily_limit,
             "last_reset": self.last_reset.isoformat(),
             "operations": [asdict(op) for op in self.operations],
+            "reservations": [asdict(res) for res in self.reservations],
         }
         tmp = self.quota_file.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -351,27 +395,160 @@ class QuotaManager:
         with self._lock:
             self._load_locked()
 
-            if enforce and self.total_used + cost > self.daily_limit:
-                pct = (self.total_used / self.daily_limit) * 100
-                raise QuotaExceededError(
-                    f"{operation!r} would exceed the daily quota: "
-                    f"{self.total_used + cost} > {self.daily_limit} units. "
-                    f"Current usage: {self.total_used}/{self.daily_limit} "
-                    f"({pct:.1f}%)"
-                )
+            if enforce:
+                self._admit_locked(operation, cost)
 
-            record = QuotaOperation(
+            record = self._record_locked(operation, cost, metadata)
+
+        return record
+
+    def _reserved_units(self) -> int:
+        return sum(res.cost for res in self.reservations)
+
+    def _admit_locked(self, operation: str, cost: int) -> None:
+        """Raise if ``cost`` more units would pass the limit. Caller holds lock.
+
+        Held reservations count, so an enforced charge cannot spend units
+        another caller has already claimed.
+        """
+        held = self._reserved_units()
+        committed = self.total_used + held
+        if committed + cost > self.daily_limit:
+            pct = (committed / self.daily_limit) * 100
+            raise QuotaExceededError(
+                f"{operation!r} would exceed the daily quota: "
+                f"{committed + cost} > {self.daily_limit} units. "
+                f"Current usage: {committed}/{self.daily_limit} "
+                f"({pct:.1f}%, {held} held by reservations)"
+            )
+
+    def _record_locked(
+        self, operation: str, cost: int, metadata: dict[str, Any] | None
+    ) -> QuotaOperation:
+        """Append a charge and persist. Caller must hold ``self._lock``."""
+        record = QuotaOperation(
+            operation=operation,
+            cost=cost,
+            timestamp=datetime.now(UTC).isoformat(),
+            brand_id=self.brand_id,
+            metadata=metadata,
+        )
+        self.operations.append(record)
+        self.total_used += cost
+        self._save_locked()
+        return record
+
+    def reserve(
+        self,
+        operation: str,
+        cost: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Reservation:
+        """Atomically check the limit and hold ``cost`` units for a call.
+
+        Unlike :meth:`check_quota` followed by :meth:`track_operation`, the
+        check and the hold happen in one lock hold, so two callers contending
+        for the last units cannot both be admitted. Settle the returned
+        :class:`Reservation` with :meth:`commit` once the request has been
+        sent (even if it then failed: Google may still have charged it), or
+        with :meth:`release` only if it certainly never was.
+
+        Args:
+            operation: Name of the call, e.g. ``"videos.insert"``.
+            cost: Units to hold. Defaults to the cost-table price of
+                ``operation``.
+            metadata: Optional payload carried onto the recorded operation.
+
+        Raises:
+            QuotaExceededError: If the hold would exceed ``daily_limit``
+                counting recorded spend and other callers' holds.
+            UnknownOperationError: If ``cost`` is omitted and the operation
+                is not in the cost table.
+        """
+        if cost is None:
+            cost = self.estimate_cost(operation)
+        if cost < 0:
+            raise ValueError(f"cost must not be negative, got {cost}")
+
+        with self._lock:
+            self._load_locked()
+            self._admit_locked(operation, cost)
+            reservation = Reservation(
+                id=uuid.uuid4().hex,
                 operation=operation,
                 cost=cost,
                 timestamp=datetime.now(UTC).isoformat(),
                 brand_id=self.brand_id,
                 metadata=metadata,
             )
-            self.operations.append(record)
-            self.total_used += cost
+            self.reservations.append(reservation)
             self._save_locked()
 
-        return record
+        return reservation
+
+    def commit(
+        self,
+        reservation: Reservation | str,
+        cost: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> QuotaOperation:
+        """Convert a hold into recorded spend. Repeating it charges nothing more.
+
+        Args:
+            reservation: The :class:`Reservation` (or its id) from
+                :meth:`reserve`.
+            cost: Units actually consumed, if different from the hold.
+            metadata: Extra payload merged over the reservation's, e.g. an
+                id only known once the call returned.
+
+        Returns:
+            The recorded :class:`QuotaOperation`; on a repeat, the record
+            the first commit made.
+
+        Raises:
+            UnknownReservationError: If the hold is gone and no recorded
+                operation carries its id.
+        """
+        res_id = reservation if isinstance(reservation, str) else reservation.id
+        if cost is not None and cost < 0:
+            raise ValueError(f"cost must not be negative, got {cost}")
+
+        with self._lock:
+            self._load_locked()
+            held = next((r for r in self.reservations if r.id == res_id), None)
+            if held is None:
+                for op in self.operations:
+                    if (op.metadata or {}).get("reservation_id") == res_id:
+                        return op
+                raise UnknownReservationError(
+                    f"no reservation {res_id!r}: already released, or the "
+                    f"ledger rolled over since it was made"
+                )
+
+            self.reservations = [r for r in self.reservations if r.id != res_id]
+            merged = {
+                **(held.metadata or {}),
+                **(metadata or {}),
+                "reservation_id": res_id,
+            }
+            return self._record_locked(
+                held.operation, held.cost if cost is None else cost, merged
+            )
+
+    def release(self, reservation: Reservation | str) -> None:
+        """Drop a hold for a request that was certainly never sent.
+
+        Releasing an already settled or unknown hold does nothing, and never
+        refunds a committed charge. If the request may have been sent, commit
+        instead: an unrecorded charge is how a ledger undercounts.
+        """
+        res_id = reservation if isinstance(reservation, str) else reservation.id
+        with self._lock:
+            self._load_locked()
+            remaining = [r for r in self.reservations if r.id != res_id]
+            if len(remaining) != len(self.reservations):
+                self.reservations = remaining
+                self._save_locked()
 
     def estimate_cost(self, operation_type: str, default: int | None = None) -> int:
         """Look an operation's unit cost up in the cost table.
@@ -395,12 +572,19 @@ class QuotaManager:
         )
 
     def check_quota(self, cost: int) -> bool:
-        """Return True if spending ``cost`` more units stays within the limit."""
+        """Return True if spending ``cost`` more units stays within the limit.
+
+        Informational only: the answer can be stale by the time you act on
+        it, because another caller may spend the same units in between. Use
+        :meth:`reserve` to claim units atomically.
+        """
         self.refresh()
-        return (self.total_used + cost) <= self.daily_limit
+        return (self.total_used + self._reserved_units() + cost) <= self.daily_limit
 
     def can_safely_perform(self, operation_type: str) -> bool:
         """Return True if the table cost of ``operation_type`` still fits.
+
+        Informational, like :meth:`check_quota`; use :meth:`reserve` to claim.
 
         Raises:
             UnknownOperationError: If the operation name is unknown.
@@ -419,7 +603,8 @@ class QuotaManager:
             "project_id": self.project_id,
             "total_used": self.total_used,
             "total_limit": self.daily_limit,
-            "remaining": self.daily_limit - self.total_used,
+            "reserved": self._reserved_units(),
+            "remaining": self.daily_limit - self.total_used - self._reserved_units(),
             "percentage_used": (self.total_used / self.daily_limit) * 100,
             "operations_count": len(self.operations),
             "last_reset": self.last_reset.isoformat(),
