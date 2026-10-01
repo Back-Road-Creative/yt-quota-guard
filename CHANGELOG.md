@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Add `QuotaManager.reserve`, `commit` and `release` (and the `Reservation` and
+  `UnknownReservationError` types): an atomic check-and-hold that closes the
+  gap between `check_quota` and `track_operation`, where two callers could both
+  pass the check for the same units. Holds count against the limit, are never
+  expired automatically, and `get_usage()` gains a `reserved` key. `check_quota`
+  and `can_safely_perform` remain informational.
+- **Behavior change:** `reset_tz` now defaults to `America/Los_Angeles`
+  (Google's quota day) instead of UTC, accepts an IANA name as well as a
+  `tzinfo`, and is stored in the ledger. A caller passing a different zone than
+  the ledger's gets `ResetZoneMismatchError`. Migration: existing ledgers keep
+  their spent units and adopt the first caller's zone, and no allowance is
+  granted at upgrade; pass `reset_tz="UTC"` to keep the old boundary. Pacific
+  needs tz data (`pip install tzdata` on Windows).
+
 ## 0.1.0
 
 First release.

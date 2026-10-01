@@ -9,6 +9,7 @@ from .manager import (
     CRITICAL_THRESHOLD_PCT,
     DEFAULT_COST_TABLE,
     DEFAULT_DAILY_LIMIT,
+    DEFAULT_RESET_TZ,
     ENV_STORAGE_PATH,
     LOCK_FILE_MODE,
     WARN_THRESHOLD_PCT,
@@ -16,7 +17,10 @@ from .manager import (
     QuotaExceededError,
     QuotaManager,
     QuotaOperation,
+    Reservation,
+    ResetZoneMismatchError,
     UnknownOperationError,
+    UnknownReservationError,
     default_storage_path,
 )
 
@@ -26,6 +30,7 @@ __all__ = [
     "CRITICAL_THRESHOLD_PCT",
     "DEFAULT_COST_TABLE",
     "DEFAULT_DAILY_LIMIT",
+    "DEFAULT_RESET_TZ",
     "ENV_STORAGE_PATH",
     "LOCK_FILE_MODE",
     "WARN_THRESHOLD_PCT",
@@ -33,7 +38,10 @@ __all__ = [
     "QuotaExceededError",
     "QuotaManager",
     "QuotaOperation",
+    "Reservation",
+    "ResetZoneMismatchError",
     "UnknownOperationError",
+    "UnknownReservationError",
     "__version__",
     "default_storage_path",
 ]
